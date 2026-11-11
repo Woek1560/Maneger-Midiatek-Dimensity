@@ -39,8 +39,11 @@ object ServiceControl {
     fun risky(s: Store): Boolean =
         s.get("thermal_paused") == "1" || !(s.get("disabled_limits") ?: "").isBlank()
 
+    fun profileAppsNeeded(s: Store): Boolean =
+        s.keys().any { it.startsWith("profile.app:") && !s.get(it).isNullOrBlank() }
+
     fun shouldRun(s: Store): Boolean =
-        s.get("watchdog") == "1" || dispNeeded(s) || netNeeded(s) || risky(s)
+        s.get("watchdog") == "1" || dispNeeded(s) || netNeeded(s) || risky(s) || profileAppsNeeded(s)
 
     fun shouldRunAtBoot(s: Store): Boolean =
         shouldRun(s) || (s.get("active") != null && s.get("boot") != "0")

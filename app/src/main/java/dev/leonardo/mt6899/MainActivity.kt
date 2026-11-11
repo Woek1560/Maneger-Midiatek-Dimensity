@@ -85,7 +85,9 @@ fun AppRoot(vm: MainViewModel) {
         }
         while (true) {
             when (tab) {
-                AppTab.Home, AppTab.Cpu, AppTab.Gpu, AppTab.Thermal -> vm.refreshLive()
+                AppTab.Home -> { vm.refreshLive(); vm.refreshProfileState() }
+                AppTab.Cpu, AppTab.Gpu, AppTab.Thermal -> vm.refreshLive()
+                AppTab.Profiles -> vm.refreshProfileState()
                 AppTab.Display -> vm.refreshDisplay()
                 else -> {}
             }

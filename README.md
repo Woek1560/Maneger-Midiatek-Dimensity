@@ -5,7 +5,7 @@
 ### Gerenciamento de CPU, GPU, temperatura, tela e rede com acesso root
 
 <p>
-  <img src="https://img.shields.io/badge/vers%C3%A3o-0.3.0-2563eb?style=for-the-badge" alt="Versão 0.3.0">
+  <img src="https://img.shields.io/badge/vers%C3%A3o-0.4.0-2563eb?style=for-the-badge" alt="Versão 0.4.0">
   <img src="https://img.shields.io/badge/Android-10%2B-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android 10 ou superior">
   <img src="https://img.shields.io/badge/Kotlin-2.0.21-7F52FF?style=for-the-badge&logo=kotlin&logoColor=white" alt="Kotlin">
   <img src="https://img.shields.io/badge/Jetpack_Compose-Material_3-4285F4?style=for-the-badge&logo=jetpackcompose&logoColor=white" alt="Jetpack Compose">
@@ -132,22 +132,26 @@ Inclui quatro perfis integrados:
 
 | Perfil | Objetivo e comportamento geral |
 |---|---|
-| **Economia** | Reduz os tetos de frequência de CPU/GPU e usa uma configuração de tela mais econômica. |
-| **Equilibrado** | Mantém uma configuração intermediária, com limites mais permissivos que Economia. |
+| **Economia** | Limita a frequência máxima de cada cluster de CPU a 60%, prioriza `powersave` e limita a GPU a 40% da frequência máxima disponível. |
+| **Equilibrado** | Mantém livre o cluster de menor capacidade, limita o segundo a 85% e os seguintes a 80% (usando `cpu_capacity`, com id da policy como desempate) e limita a GPU a 75%. Usa governor dinâmico. |
 | **Desempenho** | Usa limites mais altos, piso de frequência para CPU/GPU e tela fixa em 120 Hz, quando suportado. |
 | **Máximo ⚠** | Configuração mais agressiva, com pisos elevados e alteração de limitador térmico. Não recomendado para uso contínuo. |
 
 Os valores exatos são calculados com base nas policies e frequências detectadas. Portanto, podem variar entre aparelhos e kernels.
 
-**Sobre governors:** Economia prioriza `powersave`, Desempenho/Máximo priorizam `performance` e Equilibrado prioriza governors intermediários. A seleção final é limitada às opções que o kernel realmente disponibiliza. Se `powersave` ou `performance` não existir, o aplicativo usa uma alternativa detectada, como `schedutil` ou `sugov_ext`, e registra essa condição nos Logs. Os limites de frequência do perfil continuam sendo aplicados separadamente.
+**Sobre governors:** Economia prioriza `powersave`; se ele não existir em uma policy, usa `schedutil`, depois `sugov_ext` ou outra opção anunciada. Equilibrado prioriza `schedutil`. Desempenho e Máximo mantêm a prioridade original (`sugov_ext`, depois `schedutil` e, por fim, a primeira opção disponível). A escolha final sempre respeita os governors que o kernel realmente disponibiliza; os limites de frequência são aplicados separadamente.
 
 Também é possível:
 
-- Salvar a configuração atual de CPU e GPU como um perfil personalizado.
-- Excluir perfis personalizados.
+- Editar os perfis integrados e restaurar seus valores originais; as alterações ficam salvas como overrides locais.
+- Ajustar teto/piso e governor de cada policy da CPU, além de teto/piso da GPU.
+- Salvar, editar e excluir perfis personalizados.
+- Criar regras por aplicativo: escolher qualquer app inicializável e associar a ele um perfil, por exemplo **Desempenho** para jogos ou Câmera. Ao sair do app, o perfil base escolhido manualmente é restaurado.
 - Permitir que os perfis controlem também as configurações das abas Tela e Rede.
 - Ativar o watchdog para reaplicar o perfil quando os valores monitorados forem alterados por outros componentes do sistema.
-- Solicitar a aplicação do perfil ativo durante a inicialização do Android.
+- Solicitar a aplicação do perfil base durante a inicialização do Android.
+
+> **Importante sobre os percentuais:** o limite de CPU representa teto de frequência em relação ao máximo reportado pelo kernel; não é um limitador de utilização em 60% do scheduler. O valor efetivo é arredondado para uma frequência/OPP aceita pelo kernel. Se `powersave` não existir em uma policy, Economia usa o governor alternativo disponível e mantém o teto de frequência.
 
 ### 7. Tela
 
@@ -404,10 +408,14 @@ O script inclui comandos específicos da MIUI/HyperOS, incluindo a operação de
 
 ## Estado do desenvolvimento
 
-**Versão documentada: 0.3.0**
+**Versão documentada: 0.4.0**
 
 Principais alterações desta versão:
 
+- Novos limites de Economia (CPU 60%, governor `powersave` quando suportado e GPU 40%) e Equilibrado (CPU 100/85/80% por capacidade dos clusters e GPU 75%).
+- Editor de perfis integrados e personalizados, com restauração dos presets originais.
+- Regras de perfil por aplicativo, incluindo retorno automático ao perfil base ao sair do aplicativo.
+- Integração das regras por aplicativo ao serviço e à proteção térmica, sem alterar os parâmetros originais de Desempenho.
 - Ajuste do controle 4G/5G para enviar a máscara de tecnologias em binário e verificar o estado relido.
 - Remoção do fallback baseado em `preferred_network_mode`, que não comprovava uma alteração real do modem.
 - Seleção de governor baseada nas opções anunciadas por cada CPU policy.

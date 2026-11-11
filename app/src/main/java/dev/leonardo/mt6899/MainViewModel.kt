@@ -51,6 +51,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     var message by mutableStateOf<String?>(null)
     var supportedHz by mutableStateOf(listOf(60, 90, 120))
     var apps by mutableStateOf<List<AppEntry>>(emptyList())
+    var appsLoading by mutableStateOf(false)
     var hasSnapshot by mutableStateOf(false)
     var moduleInfo by mutableStateOf("")
     var usageGranted by mutableStateOf(false)
@@ -108,6 +109,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
         info = engine.detect()
         detectRates()
+        // Migra instalações anteriores: o perfil ativo passa a ser o perfil base
+        // usado quando nenhum aplicativo possuir uma regra própria.
+        if (store.get("profile.base").isNullOrBlank()) {
+            store.get("active")?.takeIf { it.isNotBlank() }?.let { store.put("profile.base", it) }
+        }
         refreshProfilesNow()
         refreshNodesNow()
         live = engine.readLive()
@@ -134,6 +140,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private fun refreshProfilesNow() {
         profiles = engine.allProfiles()
         prefs["active"] = store.get("active") ?: ""
+        prefs["profile.base"] = store.get("profile.base") ?: ""
+    }
+
+    fun refreshProfileState() = io {
+        prefs["active"] = store.get("active") ?: ""
+        prefs["profile.base"] = store.get("profile.base") ?: ""
     }
 
     fun refreshExtras() = io { extras = engine.readExtras() }
@@ -214,6 +226,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     // ───────────────────────── perfis ─────────────────────────
 
     fun applyProfile(p: Profile) = io {
+        // Perfil escolhido manualmente: é a referência para retornar ao sair de um app com regra.
+        store.put("profile.base", p.name)
+        prefs["profile.base"] = p.name
         message = "Aplicando '${p.name}'…"
         val res = engine.applyProfile(p)
         report("Perfil '${p.name}'", res)
@@ -227,15 +242,82 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun saveCurrentAs(name: String) = io {
         val n = name.trim()
         if (n.isEmpty()) return@io
+        if (engine.allProfiles().any { it.name.equals(n, ignoreCase = true) }) {
+            message = "Já existe um perfil com esse nome. Escolha outro ou edite o perfil existente."
+            return@io
+        }
         engine.saveProfile(engine.captureCurrent(n))
         refreshProfilesNow()
         message = "Perfil '$n' salvo"
     }
 
-    fun deleteProfile(name: String) = io {
-        engine.deleteProfile(name)
+    fun saveEditedProfile(profile: Profile) = io {
+        engine.saveProfile(profile)
+        val shouldReapply = store.get("active") == profile.name
+        if (shouldReapply) {
+            val result = engine.applyByName(profile.name)
+            report("Perfil '${profile.name}' atualizado", result)
+        } else {
+            message = "Alterações de '${profile.name}' salvas"
+        }
         refreshProfilesNow()
+        refreshAfterWrite()
+        ServiceControl.sync(ctx, store)
+    }
+
+    fun resetBuiltinProfile(name: String) = io {
+        val original = engine.resetBuiltinProfile(name) ?: return@io
+        if (store.get("active") == name) {
+            val result = engine.applyProfile(original)
+            report("Perfil '$name' restaurado", result)
+        } else {
+            message = "Configuração original de '$name' restaurada"
+        }
+        refreshProfilesNow()
+        refreshAfterWrite()
+        ServiceControl.sync(ctx, store)
+    }
+
+    fun deleteProfile(name: String) = io {
+        // Remove regras que apontariam para um perfil que deixou de existir.
+        store.keys().filter { it.startsWith("profile.app:") && store.get(it) == name }.forEach {
+            store.remove(it)
+        }
+        engine.deleteProfile(name)
+        val baseProfile = store.get("profile.base")?.takeIf { it.isNotBlank() && it != name } ?: "Equilibrado"
+        store.put("profile.base", baseProfile)
+        if (store.get("active") == name) engine.applyByName(baseProfile)
+        loadPrefs()
+        refreshProfilesNow()
+        ServiceControl.sync(ctx, store)
         message = "Perfil '$name' excluído"
+    }
+
+    fun setAppProfile(pkg: String, profileName: String?) = io {
+        val key = "profile.app:$pkg"
+        if (profileName.isNullOrBlank()) {
+            val previous = store.get(key)
+            store.remove(key)
+            prefs.remove(key)
+            // Se este era o perfil aplicado pela regra removida, restaura o perfil base.
+            if (previous != null && store.get("active") == previous) {
+                val base = store.get("profile.base")?.takeIf { it.isNotBlank() } ?: "Equilibrado"
+                store.put("profile.base", base)
+                prefs["profile.base"] = base
+                engine.applyByName(base)
+                refreshAfterWrite()
+            }
+        } else {
+            // Garante um perfil de retorno mesmo em instalação sem perfil base definido.
+            if (store.get("profile.base").isNullOrBlank()) {
+                store.put("profile.base", "Equilibrado")
+                prefs["profile.base"] = "Equilibrado"
+            }
+            store.put(key, profileName)
+            prefs[key] = profileName
+        }
+        ServiceControl.sync(ctx, store)
+        refreshProfilesNow()
     }
 
     fun captureSnapshot() = io {
@@ -255,15 +337,21 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     // ───────────────────────── tela ─────────────────────────
 
     fun loadApps() {
-        if (apps.isNotEmpty()) return
+        if (apps.isNotEmpty() || appsLoading) return
         io {
-            val pm = ctx.packageManager
-            val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-            @Suppress("DEPRECATION")
-            val list = pm.queryIntentActivities(intent, 0)
-            apps = list.map { AppEntry(it.loadLabel(pm).toString(), it.activityInfo.packageName) }
-                .distinctBy { it.pkg }
-                .sortedBy { it.label.lowercase() }
+            appsLoading = true
+            try {
+                val pm = ctx.packageManager
+                val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                @Suppress("DEPRECATION")
+                val list = pm.queryIntentActivities(intent, 0)
+                apps = list.map { AppEntry(it.loadLabel(pm).toString(), it.activityInfo.packageName) }
+                    .distinctBy { it.pkg }
+                    .sortedBy { it.label.lowercase() }
+                usageGranted = hasUsageAccess()
+            } finally {
+                appsLoading = false
+            }
         }
     }
 

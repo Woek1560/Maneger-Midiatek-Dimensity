@@ -1,6 +1,10 @@
 package dev.leonardo.mt6899.ui
 
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -15,9 +19,11 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -25,6 +31,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import dev.leonardo.mt6899.LiveStatus
 import dev.leonardo.mt6899.MainViewModel
+import dev.leonardo.mt6899.AppEntry
 import dev.leonardo.mt6899.core.GpuLimit
 import dev.leonardo.mt6899.core.Profile
 import java.util.Locale
@@ -273,8 +280,11 @@ private fun profileSummary(p: Profile): String {
     p.values.entries.filter { it.key.endsWith(".max") && it.key.startsWith("cpu") }.forEach {
         parts.add("${it.key.substringBefore('.')} máx " + (if (it.value == "0") "livre" else mhz(it.value.toLongOrNull() ?: 0L)))
     }
-    p.values["gpu.max_khz"]?.let { if (it != "0") parts.add("GPU ≤ " + mhz(it.toLongOrNull() ?: 0L)) }
-    p.values["gpu.min_khz"]?.let { if (it != "0") parts.add("GPU ≥ " + mhz(it.toLongOrNull() ?: 0L)) }
+    p.values.entries.filter { it.key.endsWith(".gov") && it.key.startsWith("cpu") }.forEach {
+        parts.add("${it.key.substringBefore('.')} ${it.value}")
+    }
+    p.values["gpu.max_khz"]?.let { if (it != "0") parts.add("GPU teto " + mhz(it.toLongOrNull() ?: 0L)) }
+    p.values["gpu.min_khz"]?.let { if (it != "0") parts.add("GPU piso " + mhz(it.toLongOrNull() ?: 0L)) }
     p.values["display.mode"]?.let { m ->
         parts.add("tela " + when (m) {
             "off" -> "Sistema"
@@ -292,13 +302,214 @@ private fun profileSummary(p: Profile): String {
     return parts.joinToString(" · ")
 }
 
+private fun percentOf(value: String?, max: Long, zeroMeansFull: Boolean): Int {
+    if (value.isNullOrBlank()) return if (zeroMeansFull) 100 else 0
+    val v = value.toLongOrNull() ?: return if (zeroMeansFull) 100 else 0
+    if (v <= 0L) return if (zeroMeansFull) 100 else 0
+    if (max <= 0L) return if (zeroMeansFull) 100 else 0
+    return ((v * 100.0 / max).toInt()).coerceIn(0, 100)
+}
+
+@Composable
+private fun ProfileEditorDialog(vm: MainViewModel, profile: Profile, onDismiss: () -> Unit) {
+    val si = vm.info ?: return
+    val cpuCaps = remember(profile.name) {
+        mutableStateMapOf<Int, Int>().apply {
+            si.policies.forEach { policy -> put(policy.id, percentOf(profile.values["cpu${policy.id}.max"], policy.maxHw, true).coerceIn(10, 100)) }
+        }
+    }
+    val cpuMins = remember(profile.name) {
+        mutableStateMapOf<Int, Int>().apply {
+            si.policies.forEach { policy -> put(policy.id, percentOf(profile.values["cpu${policy.id}.min"], policy.maxHw, false).coerceIn(0, 60)) }
+        }
+    }
+    val cpuGovs = remember(profile.name) {
+        mutableStateMapOf<Int, String>().apply {
+            si.policies.forEach { policy ->
+                val current = profile.values["cpu${policy.id}.gov"]
+                val selected = current?.takeIf { policy.governors.contains(it) }
+                    ?: policy.governors.firstOrNull { it == "schedutil" }
+                    ?: policy.governors.firstOrNull().orEmpty()
+                if (selected.isNotBlank()) put(policy.id, selected)
+            }
+        }
+    }
+    val gpuOpps = si.gpuOpps.map { it.kHz }.filter { it > 0 }.distinct().sorted()
+    val gpuTop = gpuOpps.maxOrNull() ?: si.gpuMaxKHz
+    var gpuCap by remember(profile.name) {
+        mutableStateOf(percentOf(profile.values["gpu.max_khz"], gpuTop, true).coerceIn(10, 100))
+    }
+    var gpuFloor by remember(profile.name) {
+        mutableStateOf(percentOf(profile.values["gpu.min_khz"], gpuTop, false).coerceIn(0, 80))
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Editar ${profile.name}") },
+        text = {
+            Column(
+                Modifier.fillMaxWidth().heightIn(max = 540.dp).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Muted("Os percentuais controlam o teto/piso de frequência, não a utilização da CPU em tempo real. O valor é arredondado para um degrau aceito pelo kernel.")
+                Text("CPU", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
+                si.policies.forEach { policy ->
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(policy.label, style = MaterialTheme.typography.bodyMedium)
+                        ValueSlider(
+                            "Teto de frequência", cpuCaps[policy.id] ?: 100, 10, 100, "%"
+                        ) { cpuCaps[policy.id] = it }
+                        ValueSlider(
+                            "Piso de frequência", cpuMins[policy.id] ?: 0, 0, 60, "%"
+                        ) { cpuMins[policy.id] = it }
+                        if (policy.governors.isNotEmpty()) {
+                            Muted("Governor")
+                            Chips(policy.governors, cpuGovs[policy.id], { cpuGovs[policy.id] = it })
+                        }
+                    }
+                    HorizontalDivider()
+                }
+                Text("GPU", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
+                if (gpuOpps.size >= 2) {
+                    ValueSlider("Teto de frequência", gpuCap, 10, 100, "%") { gpuCap = it }
+                    ValueSlider("Piso de frequência", gpuFloor, 0, 80, "%") { gpuFloor = it }
+                    Muted("100% no teto significa sem limite deste gerenciador. 0% no piso não força frequência mínima.")
+                } else {
+                    Muted("Tabela de frequências da GPU indisponível; os limites de GPU não podem ser editados neste aparelho.")
+                }
+                Muted("As demais opções do perfil (térmica, tela, rede e nós do kernel) serão preservadas.")
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                val values = LinkedHashMap(profile.values)
+                si.policies.forEach { policy ->
+                    val pct = (cpuCaps[policy.id] ?: 100).coerceIn(10, 100)
+                    val target = policy.maxHw * pct / 100L
+                    val cap = if (pct >= 100) 0L else
+                        policy.freqs.lastOrNull { it <= target } ?: policy.freqs.firstOrNull() ?: target
+                    val minPct = (cpuMins[policy.id] ?: 0).coerceIn(0, 60)
+                    var floor = if (minPct <= 0) 0L else {
+                        val minTarget = policy.maxHw * minPct / 100L
+                        policy.freqs.firstOrNull { it >= minTarget } ?: policy.freqs.lastOrNull() ?: minTarget
+                    }
+                    if (cap > 0L && floor > cap) floor = cap
+                    values["cpu${policy.id}.max"] = cap.toString()
+                    values["cpu${policy.id}.min"] = floor.toString()
+                    cpuGovs[policy.id]?.let { values["cpu${policy.id}.gov"] = it }
+                }
+                if (gpuOpps.size >= 2) {
+                    val gpuCapKHz = if (gpuCap >= 100) 0L else {
+                        val target = gpuTop * gpuCap / 100L
+                        gpuOpps.lastOrNull { it <= target } ?: gpuOpps.first()
+                    }
+                    val effectiveFloor = gpuFloor.coerceAtMost(if (gpuCap >= 100) 80 else gpuCap)
+                    val gpuFloorKHz = if (effectiveFloor <= 0) 0L else {
+                        val target = gpuTop * effectiveFloor / 100L
+                        gpuOpps.firstOrNull { it >= target } ?: gpuOpps.last()
+                    }
+                    values["gpu.max_khz"] = gpuCapKHz.toString()
+                    values["gpu.min_khz"] = gpuFloorKHz.toString()
+                }
+                vm.saveEditedProfile(profile.copy(values = values))
+                onDismiss()
+            }) { Text("Salvar alterações") }
+        },
+        dismissButton = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (profile.builtin) {
+                    TextButton(onClick = { vm.resetBuiltinProfile(profile.name); onDismiss() }) { Text("Restaurar padrão") }
+                }
+                TextButton(onClick = onDismiss) { Text("Cancelar") }
+            }
+        }
+    )
+}
+
+@Composable
+private fun AppProfileRuleDialog(vm: MainViewModel, onDismiss: () -> Unit) {
+    var query by remember { mutableStateOf("") }
+    var selectedApp by remember { mutableStateOf<AppEntry?>(null) }
+    var selectedProfile by remember { mutableStateOf("Desempenho") }
+    val filtered = vm.apps.filter {
+        query.isBlank() || it.label.contains(query, true) || it.pkg.contains(query, true)
+    }.take(80)
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (selectedApp == null) "Escolher aplicativo" else "Perfil para o aplicativo") },
+        text = {
+            Column(
+                Modifier.fillMaxWidth().heightIn(max = 520.dp).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                if (selectedApp == null) {
+                    OutlinedTextField(
+                        value = query,
+                        onValueChange = { query = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        label = { Text("Buscar aplicativo") }
+                    )
+                    if (vm.appsLoading) Muted("Carregando aplicativos…")
+                    filtered.forEach { app ->
+                        TextButton(onClick = { selectedApp = app }, modifier = Modifier.fillMaxWidth()) {
+                            Column(Modifier.fillMaxWidth()) {
+                                Text(app.label)
+                                Muted(app.pkg)
+                            }
+                        }
+                    }
+                    if (!vm.appsLoading && filtered.isEmpty()) Muted("Nenhum aplicativo encontrado.")
+                } else {
+                    Text(selectedApp!!.label, style = MaterialTheme.typography.titleMedium)
+                    Muted(selectedApp!!.pkg)
+                    Text("Perfil a aplicar", style = MaterialTheme.typography.bodyMedium)
+                    Chips(vm.profiles.map { it.name }, selectedProfile, { selectedProfile = it })
+                    TextButton(onClick = { selectedApp = null }) { Text("Escolher outro aplicativo") }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = selectedApp != null && vm.profiles.any { it.name == selectedProfile },
+                onClick = {
+                    selectedApp?.let { vm.setAppProfile(it.pkg, selectedProfile) }
+                    onDismiss()
+                }
+            ) { Text("Salvar regra") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancelar") } }
+    )
+}
+
 @Composable
 fun ProfilesScreen(vm: MainViewModel) {
     var saveDialog by remember { mutableStateOf(false) }
     var newName by remember { mutableStateOf("") }
+    var editingProfile by remember { mutableStateOf<Profile?>(null) }
+    var appRuleDialog by remember { mutableStateOf(false) }
     val active = vm.pref("active")
+    val base = vm.pref("profile.base")
+    val profileNames = vm.profiles.map { it.name }
+    val appRules = vm.prefs.filterKeys { it.startsWith("profile.app:") }
+
+    LaunchedEffect(Unit) { vm.loadApps() }
+
     ScreenColumn {
-        Muted("Toque para aplicar. O perfil ativo é mantido pelo serviço, se ligado.")
+        Muted("Toque em Aplicar para definir o perfil base. As regras por aplicativo podem substituí-lo temporariamente.")
+        if (!base.isNullOrBlank()) KV("Perfil base", base)
+        if (!active.isNullOrBlank() && active != base) KV("Perfil aplicado agora", active)
+        vm.info?.let { si ->
+            val unsupported = si.policies.filter { !it.governors.contains("powersave") }
+            if (unsupported.isNotEmpty()) {
+                Muted("Economia: powersave não está disponível em ${unsupported.joinToString { it.label }}. Nesses clusters será usado o governor alternativo disponível; o teto de 60% continua aplicado.")
+            }
+            if (si.gpuOpps.isEmpty()) {
+                Muted("A tabela OPP da GPU não foi detectada. Os tetos percentuais de GPU não podem ser aplicados pelo GED neste kernel.")
+            }
+        }
+
         for (p in vm.profiles) {
             Card(
                 Modifier.fillMaxWidth(),
@@ -306,26 +517,62 @@ fun ProfilesScreen(vm: MainViewModel) {
                     containerColor = if (p.name == active) MaterialTheme.colorScheme.surfaceVariant else MaterialTheme.colorScheme.surface
                 )
             ) {
-                androidx.compose.foundation.layout.Column(
-                    Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
+                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(
-                            p.name + if (p.name == active) "  ● ativo" else "",
+                            p.name + when {
+                                p.name == active -> "  ● ativo"
+                                p.name == base -> "  · base"
+                                else -> ""
+                            },
                             Modifier.weight(1f), style = MaterialTheme.typography.titleMedium
                         )
                     }
                     Muted(profileSummary(p))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(onClick = { vm.applyProfile(p) }) { Text("Aplicar '${p.name}'") }
+                        Button(onClick = { vm.applyProfile(p) }) { Text("Aplicar") }
+                        TextButton(onClick = { editingProfile = p }) { Text("Editar") }
                         if (!p.builtin) TextButton(onClick = { vm.deleteProfile(p.name) }) { Text("Excluir") }
                     }
                 }
             }
         }
         Section("Salvar estado atual como perfil") {
-            Muted("Captura governors, min/max de cada cluster e teto/piso da GPU como estão agora.")
+            Muted("Captura governors, limites de frequência dos clusters e teto/piso da GPU.")
             Button(onClick = { newName = ""; saveDialog = true }) { Text("Salvar estado atual") }
+        }
+        Section("Perfis por aplicativo") {
+            Muted("Quando um app configurado abrir, o perfil escolhido será aplicado. Ao sair dele, o perfil base será restaurado. Ex.: Desempenho para jogos ou Câmera.")
+            if (!vm.usageGranted) {
+                Text("O serviço tentará identificar o app em primeiro plano via root; o acesso a dados de uso melhora a confiabilidade.", style = MaterialTheme.typography.bodySmall)
+                OutlinedButton(onClick = { vm.grantUsageAccess() }) { Text("Conceder acesso ao uso de apps") }
+            } else {
+                Muted("Acesso ao uso de aplicativos: concedido")
+            }
+            if (appRules.isEmpty()) {
+                Muted("Nenhuma regra configurada.")
+            } else {
+                appRules.toSortedMap().forEach { (key, profileName) ->
+                    val pkg = key.removePrefix("profile.app:")
+                    val app = vm.apps.firstOrNull { it.pkg == pkg }
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text(app?.label ?: pkg, style = MaterialTheme.typography.bodyMedium)
+                                Muted(pkg)
+                            }
+                            TextButton(onClick = { vm.setAppProfile(pkg, null) }) { Text("Remover") }
+                        }
+                        Chips(
+                            profileNames,
+                            profileName,
+                            onSelect = { vm.setAppProfile(pkg, it) }
+                        )
+                    }
+                    HorizontalDivider()
+                }
+            }
+            Button(onClick = { vm.loadApps(); appRuleDialog = true }) { Text("Adicionar regra por aplicativo") }
         }
         Section("Automação") {
             SwitchRow(
@@ -335,7 +582,7 @@ fun ProfilesScreen(vm: MainViewModel) {
             ) { vm.setPref("prof_ctrl", if (it) "1" else "0") }
             SwitchRow(
                 "Reaplicar perfil (watchdog)",
-                "Reaplica o perfil quando mi_thermald/perf HAL mudarem os nós e vigia a temperatura.",
+                "Reaplica o perfil base quando mi_thermald/perf HAL alterarem os nós e vigia a temperatura. As regras por app continuam funcionando independentemente desta opção.",
                 vm.pref("watchdog") == "1"
             ) { vm.setPref("watchdog", if (it) "1" else "0") }
             SwitchRow(
@@ -350,9 +597,18 @@ fun ProfilesScreen(vm: MainViewModel) {
             title = { Text("Nome do perfil") },
             text = { OutlinedTextField(value = newName, onValueChange = { newName = it }, singleLine = true) },
             confirmButton = {
-                TextButton(onClick = { saveDialog = false; vm.saveCurrentAs(newName) }) { Text("Salvar") }
+                TextButton(
+                    enabled = newName.trim().isNotEmpty(),
+                    onClick = { saveDialog = false; vm.saveCurrentAs(newName) }
+                ) { Text("Salvar") }
             },
             dismissButton = { TextButton(onClick = { saveDialog = false }) { Text("Cancelar") } }
         )
+    }
+    editingProfile?.let { profile ->
+        ProfileEditorDialog(vm, profile) { editingProfile = null }
+    }
+    if (appRuleDialog) {
+        AppProfileRuleDialog(vm) { appRuleDialog = false }
     }
 }

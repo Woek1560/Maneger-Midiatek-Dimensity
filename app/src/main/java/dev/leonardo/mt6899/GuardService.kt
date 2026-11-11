@@ -89,8 +89,9 @@ class GuardService : Service() {
             return@coroutineScope
         }
         val engine = Engine(RootShell, store) { LogBuffer.add("PERFIL", it, if (it.startsWith("FALHA")) 'W' else 'I') }
-        val needsGuard = store.get("watchdog") == "1" || engine.isRisky() || fromBoot
-        if (needsGuard) launch { guardLoop(engine, store, fromBoot) }
+        // O loop também monitora regras por aplicativo; regras podem ser adicionadas
+        // enquanto o serviço já está ativo por causa da tela ou da rede.
+        launch { guardLoop(engine, store, fromBoot) }
         if (ServiceControl.dispNeeded(store)) launch { DisplayController(this@GuardService, RootShell, store).loop() }
         if (ServiceControl.netNeeded(store)) launch { netLoop(NetworkController(this@GuardService, RootShell, store)) }
 
@@ -115,11 +116,13 @@ class GuardService : Service() {
     private suspend fun guardLoop(engine: Engine, store: Store, fromBoot: Boolean) {
         if (fromBoot) {
             delay(20_000) // deixa o sistema assentar depois do boot
-            val name = store.get("active")
+            val name = store.get("profile.base")?.takeIf { it.isNotBlank() }
+                ?: store.get("active")?.takeIf { it.isNotBlank() }
             if (name != null && store.get("boot") != "0") {
-                LogBuffer.add("SERVICO", "aplicando '$name' no boot")
+                LogBuffer.add("SERVICO", "aplicando perfil base '$name' no boot")
                 try {
                     engine.detect()
+                    store.put("profile.base", name)
                     engine.applyByName(name)
                 } catch (t: CancellationException) {
                     throw t
@@ -131,23 +134,35 @@ class GuardService : Service() {
         }
         var lastSafe = 0L
         var lastGameState: Boolean? = null
+        var lastForeground: String? = null
+        var thermalHold = false
         val foreground = ForegroundWatcher(this, RootShell)
         while (currentCoroutineContext().isActive) {
             val watch = store.get("watchdog") == "1"
-            if (watch || engine.isRisky()) {
+            val risky = engine.isRisky()
+            val appRules = ServiceControl.profileAppsNeeded(store)
+
+            if (watch || risky || thermalHold) {
                 try {
                     if (engine.info == null) engine.detect()
-                    val trip = engine.guardTrip(engine.readLive())
+                    val live = engine.readLive()
+                    val trip = engine.guardTrip(live)
                     val now = System.currentTimeMillis()
                     if (trip != null) {
+                        thermalHold = true
                         if (now - lastSafe > 60_000L) {
                             lastSafe = now
                             LogBuffer.add("GUARDA", "disparou: $trip", 'W')
                             engine.safeMode(trip)
                         }
-                    } else if (watch) {
-                        // Durante jogos, deixa o GameTime/Power HAL gerenciar DVFS.
-                        // A guarda térmica acima continua ativa normalmente.
+                    } else if (thermalHold && engine.guardReason(live) == null) {
+                        thermalHold = false
+                        LogBuffer.add("GUARDA", "temperaturas normalizadas; regras por app liberadas novamente")
+                    }
+
+                    if (watch && trip == null) {
+                        // Durante jogos, deixa GameTime/Power HAL gerenciar DVFS.
+                        // A guarda térmica continua ativa normalmente.
                         val inGame = foreground.isGameForeground()
                         if (lastGameState != inGame) {
                             lastGameState = inGame
@@ -161,8 +176,40 @@ class GuardService : Service() {
                     LogBuffer.add("GUARDA", "erro: ${t.message}", 'E')
                 }
             }
+
+            // Regras por app têm prioridade enquanto o app está aberto. Ao sair dele,
+            // o perfil escolhido manualmente (profile.base) volta a ser aplicado.
+            if (appRules && !thermalHold) {
+                try {
+                    if (engine.info == null) engine.detect()
+                    val pkg = foreground.current()
+                    if (pkg != null && pkg != lastForeground) {
+                        lastForeground = pkg
+                        LogBuffer.add("APP", "primeiro plano: $pkg")
+                    }
+                    val appProfile = pkg?.let { store.get("profile.app:$it")?.takeIf(String::isNotBlank) }
+                    val baseProfile = store.get("profile.base")?.takeIf { it.isNotBlank() }
+                        ?: store.get("active")?.takeIf { it.isNotBlank() }
+                    val target = appProfile ?: baseProfile
+                    val active = store.get("active")
+                    if (target != null && target != active) {
+                        LogBuffer.add(
+                            "PERFIL",
+                            if (appProfile != null) "regra por app: $pkg → '$target'" else "sem regra para $pkg; retornando a '$target'"
+                        )
+                        engine.applyByName(target)
+                    }
+                } catch (t: CancellationException) {
+                    throw t
+                } catch (t: Throwable) {
+                    LogBuffer.add("APP", "falha na regra por app: ${t.message}", 'E')
+                }
+            }
+
+            // Quando não há vigilância térmica, o loop apenas verifica regras por app
+            // sem fazer leituras pesadas de CPU/GPU.
             val iv = (store.get("interval")?.toLongOrNull() ?: 30L).coerceIn(10L, 120L)
-            delay(iv * 1000L)
+            delay(if (appRules) 2000L else iv * 1000L)
         }
     }
 

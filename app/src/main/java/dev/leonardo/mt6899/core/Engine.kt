@@ -388,6 +388,9 @@ class Engine(
             val f = pc.freqs.lastOrNull { it <= v }
             if (f != null) return f
             pc.freqs.firstOrNull()?.let { return it }
+            // Alguns drivers cpufreq não publicam scaling_available_frequencies.
+            // Nesse caso, preserva o teto solicitado dentro da faixa de hardware.
+            if (pc.maxHw > 0L) return v.coerceIn(pc.minHw.coerceAtLeast(1L), pc.maxHw)
         }
         return pc.maxHw
     }
@@ -396,7 +399,10 @@ class Engine(
         if (v <= 0) return pc.minHw
         val f = pc.freqs.firstOrNull { it >= v }
         if (f != null) return f
-        return pc.freqs.lastOrNull() ?: pc.maxHw
+        pc.freqs.lastOrNull()?.let { return it }
+        // Sem lista de degraus, não transforme um piso percentual em maxHw.
+        if (pc.maxHw > 0L) return v.coerceIn(pc.minHw.coerceAtLeast(1L), pc.maxHw)
+        return pc.maxHw
     }
 
     fun setCpu(policy: Int, minK: Long?, maxK: Long?, gov: String?): List<WriteResult> {
@@ -510,32 +516,50 @@ class Engine(
     // ───────────────────────── perfis ─────────────────────────
 
     /**
-     * Perfis internos. Melhorias em relação à v0.1:
-     *  - Economia: tira mais do cluster prime (o mais caro em energia) e preserva o little; PELT 2.
-     *  - Equilibrado: limita só o topo do prime (90%), pois o último degrau custa muito e rende pouco.
-     *  - Desempenho: piso moderado de CPU/GPU, UFS fixado no clock máximo, tela fixa em 120 Hz, 5G sempre liberado.
-     *  - Todos (exceto Máximo) religam o limitador térmico THERMAL_AP e normalizam PELT/UFS ao trocar de perfil.
-     *  - Os valores de tela/rede só são aplicados se "Perfis controlam tela e rede" estiver ligado.
+     * Perfis padrão. Os percentuais são convertidos para degraus existentes no kernel.
+     * Economia limita CPU/GPU de forma explícita; Equilibrado reduz os clusters maiores.
+     * Desempenho e Máximo mantêm seus parâmetros originais.
      */
     fun builtins(): List<Profile> {
         val si = info ?: return emptyList()
         val ufsMin = si.ufs?.freqs?.minOrNull()?.toString()
         val ufsMax = si.ufs?.freqs?.maxOrNull()?.toString()
+        // Os limites deste perfil são escritos no GED por índice OPP; uma tabela
+        // devfreq isolada não basta para converter o teto em um índice GED seguro.
+        val gpuMax = si.gpuOpps.maxOfOrNull { it.kHz } ?: 0L
+        val gpuOppsAsc = si.gpuOpps.map { it.kHz }.filter { it > 0 }.sorted()
 
-        fun base(caps: List<Int>, floors: List<Long>, gpuMax: Long, gpuMin: Long): LinkedHashMap<String, String> {
+        fun cpuCapAt(percent: Int, p: CpuPolicy): Long {
+            if (percent >= 100 || p.maxHw <= 0L) return 0L
+            val target = (p.maxHw * percent.coerceIn(1, 100) / 100L)
+                .coerceAtLeast(p.minHw.coerceAtLeast(1L))
+            return p.freqs.lastOrNull { it <= target } ?: p.freqs.firstOrNull() ?: target
+        }
+
+        fun gpuCapAt(percent: Int): Long {
+            if (percent >= 100 || gpuMax <= 0L || gpuOppsAsc.isEmpty()) return 0L
+            val target = gpuMax * percent.coerceIn(1, 100) / 100L
+            return gpuOppsAsc.lastOrNull { it <= target } ?: gpuOppsAsc.first()
+        }
+
+        fun governorFor(p: CpuPolicy, preferred: String): String? = when {
+            p.governors.contains(preferred) -> preferred
+            preferred == "powersave" && p.governors.contains("schedutil") -> "schedutil"
+            p.governors.contains("sugov_ext") -> "sugov_ext"
+            p.governors.contains("schedutil") -> "schedutil"
+            else -> p.governors.firstOrNull()
+        }
+
+        fun base(caps: List<Int>, floors: List<Long>, gpuMaxKHz: Long, gpuMin: Long,
+                 preferredGov: String): LinkedHashMap<String, String> {
             val v = LinkedHashMap<String, String>()
             si.policies.forEachIndexed { i, p ->
-                val gov = when {
-                    p.governors.contains("sugov_ext") -> "sugov_ext"
-                    p.governors.contains("schedutil") -> "schedutil"
-                    else -> p.governors.firstOrNull() ?: ""
-                }
-                if (gov.isNotEmpty()) v["cpu${p.id}.gov"] = gov
-                val cap = if (i in caps.indices) caps[i] else caps.last()
-                v["cpu${p.id}.max"] = if (cap >= 100) "0" else (p.maxHw * cap / 100).toString()
-                v["cpu${p.id}.min"] = (if (i in floors.indices) floors[i] else 0L).toString()
+                governorFor(p, preferredGov)?.let { v["cpu${p.id}.gov"] = it }
+                val cap = caps.getOrElse(i) { caps.lastOrNull() ?: 100 }
+                v["cpu${p.id}.max"] = cpuCapAt(cap, p).toString()
+                v["cpu${p.id}.min"] = (floors.getOrElse(i) { 0L }).toString()
             }
-            v["gpu.max_khz"] = gpuMax.toString()
+            v["gpu.max_khz"] = gpuMaxKHz.toString()
             v["gpu.min_khz"] = gpuMin.toString()
             return v
         }
@@ -556,16 +580,36 @@ class Engine(
             return v
         }
 
-        // Economia não impõe teto/piso artificial: mantém DVFS e OPPs da ROM/kernel.
-        // PELT, UFS, tela e modem ficam sob controle do sistema para evitar trabalho
-        // extra e políticas concorrentes. THERMAL_AP permanece habilitado.
-        val eco = extras(base(listOf(100, 100, 100), listOf(0, 0, 0), 0L, 0L), "4", false, true, "off", 120, 60, "off").apply {
+        // Economia: teto de 60% por cluster, governor powersave (schedutil quando ausente)
+        // e teto da GPU em 40% da frequência máxima disponível.
+        val ecoCaps = si.policies.map { 60 }
+        val eco = extras(
+            base(ecoCaps, List(si.policies.size) { 0L }, gpuCapAt(40), 0L, "powersave"),
+            "4", false, true, "off", 120, 60, "off"
+        ).apply {
             remove("node:sched.pelt")
             remove("node:ufs.min")
         }
-        val bal = extras(base(listOf(100, 100, 90), listOf(0, 0, 0), 0L, 0L), "4", false, true, "auto", 120, 60, "dynamic")
-        val perf = extras(base(listOf(100, 100, 100), listOf(1000000L, 1200000L, 1200000L), 0L, 520000L), "4", true, true, "fixed", 120, 120, "5g")
-        val max = extras(base(listOf(100, 100, 100), listOf(1300000L, 1500000L, 1500000L), 0L, 702000L), "4", true, false, "fixed", 120, 120, "5g")
+
+        // Equilibrado mantém livre o cluster de menor capacidade e reduz os maiores.
+        // A capacidade vem de cpu_capacity; quando ausente, o id da policy desempata.
+        // GPU limitada a 75%, sem piso forçado; governor dinâmico.
+        val balancedRank = si.policies
+            .sortedWith(compareBy<CpuPolicy> { it.capacity ?: Int.MAX_VALUE }.thenBy { it.id })
+            .mapIndexed { index, policy -> policy.id to index }
+            .toMap()
+        val balancedCaps = si.policies.map { policy ->
+            when (balancedRank[policy.id] ?: 0) { 0 -> 100; 1 -> 85; else -> 80 }
+        }
+        val bal = extras(
+            base(balancedCaps, List(si.policies.size) { 0L }, gpuCapAt(75), 0L, "schedutil"),
+            "4", false, true, "auto", 120, 60, "dynamic"
+        )
+
+        // NÃO ALTERAR: parâmetros originais do perfil Desempenho.
+        val perf = extras(base(listOf(100, 100, 100), listOf(1000000L, 1200000L, 1200000L), 0L, 520000L, "auto"), "4", true, true, "fixed", 120, 120, "5g")
+        // NÃO ALTERAR: parâmetros originais do perfil Máximo.
+        val max = extras(base(listOf(100, 100, 100), listOf(1300000L, 1500000L, 1500000L), 0L, 702000L, "auto"), "4", true, false, "fixed", 120, 120, "5g")
 
         return listOf(
             Profile("Economia", eco, true),
@@ -575,16 +619,37 @@ class Engine(
         )
     }
 
-    fun allProfiles(): List<Profile> = builtins() + Profile.decode(store.get("profiles"))
+    fun allProfiles(): List<Profile> {
+        val defaults = builtins()
+        val overrides = Profile.decode(store.get("profile_overrides")).associateBy { it.name }
+        val merged = defaults.map { base ->
+            val saved = overrides[base.name]
+            if (saved == null) base else base.copy(values = LinkedHashMap(saved.values))
+        }
+        return merged + Profile.decode(store.get("profiles"))
+    }
 
     fun saveProfile(p: Profile) {
-        val cur = Profile.decode(store.get("profiles")).filter { it.name != p.name }
-        store.put("profiles", Profile.encode(cur + p.copy(builtin = false)))
+        val builtinNames = builtins().map { it.name }.toSet()
+        if (p.name in builtinNames) {
+            val cur = Profile.decode(store.get("profile_overrides")).filter { it.name != p.name }
+            store.put("profile_overrides", Profile.encode(cur + p.copy(builtin = false)))
+        } else {
+            val cur = Profile.decode(store.get("profiles")).filter { it.name != p.name }
+            store.put("profiles", Profile.encode(cur + p.copy(builtin = false)))
+        }
     }
 
     fun deleteProfile(name: String) {
         val cur = Profile.decode(store.get("profiles")).filter { it.name != name }
         store.put("profiles", Profile.encode(cur))
+    }
+
+    fun resetBuiltinProfile(name: String): Profile? {
+        val original = builtins().firstOrNull { it.name == name } ?: return null
+        val cur = Profile.decode(store.get("profile_overrides")).filter { it.name != name }
+        store.put("profile_overrides", Profile.encode(cur))
+        return original
     }
 
     fun captureCurrent(name: String): Profile {
@@ -613,7 +678,9 @@ class Engine(
         for (p in si.policies) {
             val gov = pr.values["cpu${p.id}.gov"]?.takeIf { p.governors.contains(it) }
             val max = pr.values["cpu${p.id}.max"]?.toLongOrNull()?.let { resolveMax(p, it) }
-            val min = pr.values["cpu${p.id}.min"]?.toLongOrNull()?.let { resolveMin(p, it) }
+            var min = pr.values["cpu${p.id}.min"]?.toLongOrNull()?.let { resolveMin(p, it) }
+            // Um teto editado não pode ficar abaixo do piso já salvo no mesmo perfil.
+            if (max != null && min != null && min > max) min = max
             if (gov != null || max != null || min != null) res.addAll(setCpu(p.id, min, max, gov))
         }
         pr.values["gpu.max_khz"]?.toLongOrNull()?.let { res.add(setGpuCeilingKHz(it)) }
